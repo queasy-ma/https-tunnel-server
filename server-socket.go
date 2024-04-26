@@ -174,7 +174,7 @@ func handleRecv(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "No active connection for this client", http.StatusNotFound)
 		return
 	}
-	connection.conn.SetReadDeadline(time.Now().Add(time.Millisecond * 200))
+	connection.conn.SetReadDeadline(time.Now().Add(time.Millisecond * 2))
 	buffer := make([]byte, 1024)
 	bytesRead, err := connection.conn.Read(buffer)
 	if err != nil {
@@ -231,6 +231,6 @@ func handleSend(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	fmt.Println("Data successfully sent ", len(decoded), " bytes to the original client.")
+	fmt.Println("Data sent to original client", len(decoded), " bytes.")
 	w.WriteHeader(http.StatusOK)
 }

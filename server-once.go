@@ -5,10 +5,10 @@ import (
 	"crypto/tls"
 	"io/ioutil"
 	"log"
-	"math/rand"
 	"net"
 	"net/http"
 	"sync"
+	"time"
 
 	"github.com/armon/go-socks5"
 	"github.com/google/uuid"
@@ -25,38 +25,110 @@ var ConnectionStore = struct {
 	Connections: make(map[string]net.Conn),
 }
 
-// recordingConn 包装 net.Conn 以捕获和记录数据，并关联 UUID
-type recordingConn struct {
+// virtualConn 是一个虚拟的net.Conn，不实际发送数据到网络
+type virtualConn struct {
 	net.Conn
-	ID string
+	ID   string
+	data []byte
 }
 
-func (c *recordingConn) Read(b []byte) (int, error) {
-	n, err := c.Conn.Read(b)
-	if n > 0 {
-		ConnectionStore.Lock()
-		ConnectionStore.Data[c.ID] = append(ConnectionStore.Data[c.ID], b[:n]...)
-		ConnectionStore.Connections[c.ID] = c.Conn
-		ConnectionStore.Unlock()
+func (vc *virtualConn) Read(b []byte) (int, error) {
+	n := copy(b, vc.data)
+	vc.data = vc.data[n:]
+	return n, nil
+}
+
+func (vc *virtualConn) Write(b []byte) (int, error) {
+	ConnectionStore.Lock()
+	ConnectionStore.Data[vc.ID] = append(ConnectionStore.Data[vc.ID], b...)
+	ConnectionStore.Unlock()
+	return len(b), nil
+}
+
+func (vc *virtualConn) Close() error {
+	return nil
+}
+
+func (vc *virtualConn) LocalAddr() net.Addr {
+	return &net.TCPAddr{
+		IP:   net.IPv4(127, 0, 0, 1),
+		Port: 0,
 	}
-	return n, err
 }
 
-func (c *recordingConn) Write(b []byte) (int, error) {
-	return c.Conn.Write(b) // 实际上只是代理写操作
+func (vc *virtualConn) RemoteAddr() net.Addr {
+	return &net.TCPAddr{
+		IP:   net.IPv4(127, 0, 0, 1),
+		Port: 0,
+	}
+}
+
+func (vc *virtualConn) SetDeadline(t time.Time) error {
+	return nil
+}
+
+func (vc *virtualConn) SetReadDeadline(t time.Time) error {
+	return nil
+}
+
+func (vc *virtualConn) SetWriteDeadline(t time.Time) error {
+	return nil
+}
+
+// StartConnectionMonitor 启动连接监视器，定期检查并清理断开的连接
+func StartConnectionMonitor(interval time.Duration) {
+	go func() {
+		for {
+			time.Sleep(interval)
+			ConnectionStore.RLock()
+			disconnected := []string{}
+
+			for id, conn := range ConnectionStore.Connections {
+				if conn == nil {
+					disconnected = append(disconnected, id)
+					continue
+				}
+				// 使用 SetReadDeadline 来测试连接是否还活跃
+				conn.SetReadDeadline(time.Now().Add(time.Millisecond * 10))
+				oneByte := make([]byte, 1)
+				if _, err := conn.Read(oneByte); err != nil {
+					if err, ok := err.(net.Error); ok && err.Timeout() {
+						// Timeout means connection is still alive but no data was read
+						conn.SetReadDeadline(time.Time{}) // Reset deadline
+						continue
+					}
+					// Connection is not active
+					disconnected = append(disconnected, id)
+				}
+				conn.SetReadDeadline(time.Time{}) // Reset deadline
+			}
+
+			ConnectionStore.RUnlock()
+
+			if len(disconnected) > 0 {
+				ConnectionStore.Lock()
+				for _, id := range disconnected {
+					delete(ConnectionStore.Connections, id)
+					delete(ConnectionStore.Data, id)
+					println("[*] delete connection: ", id)
+				}
+				ConnectionStore.Unlock()
+			}
+		}
+	}()
 }
 
 // setupSocks5Server 设置并启动 SOCKS5 服务器
 func setupSocks5Server() {
 	conf := &socks5.Config{
 		Dial: func(ctx context.Context, network, addr string) (net.Conn, error) {
-			baseConn, err := net.Dial(network, addr)
-			if err != nil {
-				return nil, err
-			}
 			reqID := uuid.New().String()
-			println(reqID, ":", baseConn)
-			return &recordingConn{Conn: baseConn, ID: reqID}, nil
+			println(reqID, ":", "Creating virtual connection")
+			vc := &virtualConn{ID: reqID}
+			ConnectionStore.Lock()
+			ConnectionStore.Connections[reqID] = vc
+			ConnectionStore.Unlock()
+			return vc, nil
 		},
 	}
 	server, err := socks5.New(conf)
@@ -75,31 +147,23 @@ func setupSocks5Server() {
 // handleTunnelRequest 处理通过 HTTP/2 来的隧道请求
 func handleTunnelRequest(w http.ResponseWriter, r *http.Request) {
 	ConnectionStore.RLock()
-	// 检查是否有可用的连接
 	if len(ConnectionStore.Connections) == 0 {
 		ConnectionStore.RUnlock()
 		http.Error(w, "No available connections", http.StatusServiceUnavailable)
 		return
 	}
 
-	// 从连接池中随机选择一个连接
 	var chosenID string
 	var chosenData []byte
-	i := rand.Intn(len(ConnectionStore.Connections))
-	for id := range ConnectionStore.Connections {
-		if i == 0 {
-			chosenID = id
-			chosenData = ConnectionStore.Data[id]
-			break
-		}
-		i--
+	for id, data := range ConnectionStore.Data {
+		chosenID = id
+		chosenData = data
+		break
 	}
 	ConnectionStore.RUnlock()
 
-	// 设置HTTP头部中的X-Request-ID
 	w.Header().Set("X-Request-ID", chosenID)
 	w.Header().Set("Content-Type", "application/octet-stream")
-	println("Sending to client...")
 	if _, err := w.Write(chosenData); err != nil {
 		log.Printf("Error sending data to client: %v", err)
 		http.Error(w, "Failed to send data", http.StatusInternalServerError)
@@ -107,6 +171,7 @@ func handleTunnelRequest(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// handleTunnelResponse 处理隧道客户端的响应
 func handleTunnelResponse(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "POST" {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -126,6 +191,8 @@ func handleTunnelResponse(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	println("Get id - ", requestID, " response ,returning origin client...")
+	println(string(body))
 	ConnectionStore.RLock()
 	conn, exists := ConnectionStore.Connections[requestID]
 	ConnectionStore.RUnlock()
@@ -133,7 +200,7 @@ func handleTunnelResponse(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Request ID not found", http.StatusNotFound)
 		return
 	}
-	println("recive result, sending...")
+
 	_, err = conn.Write(body)
 	if err != nil {
 		log.Printf("Error sending response back to client: %v", err)
@@ -141,7 +208,6 @@ func handleTunnelResponse(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	log.Printf("Successfully handled request for %s", requestID)
 	w.WriteHeader(http.StatusOK)
 }
 
@@ -159,5 +225,6 @@ func main() {
 
 	log.Println("Starting HTTP/2 server on :443")
 	setupSocks5Server()
+	//StartConnectionMonitor(5 * time.Second) // 每10秒检查一次连接状态
 	log.Fatal(server.ListenAndServeTLS("cert.crt", "key.key"))
 }
