@@ -2,7 +2,6 @@ package main
 
 import (
 	"bufio"
-	"encoding/base64"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -176,20 +175,33 @@ func handleRecv(w http.ResponseWriter, r *http.Request) {
 	}
 	connection.conn.SetReadDeadline(time.Now().Add(time.Millisecond * 2))
 	buffer := make([]byte, 1024)
-	bytesRead, err := connection.conn.Read(buffer)
-	if err != nil {
-		if err == io.EOF {
-			// Client has closed the connection
-			println("Client has closed the connection", http.StatusGone)
-		} else {
-			// Some other error
-			println(err.Error(), http.StatusInternalServerError)
+	var totalData []byte
+	totalBytesRead := 0
+	for {
+		bytesRead, err := connection.conn.Read(buffer)
+		if err != nil {
+			if err == io.EOF {
+				// 客户端已关闭连接
+				println("Client has closed the connection", http.StatusGone)
+			} else {
+				// 其他错误
+				println(err.Error(), http.StatusInternalServerError)
+			}
+			break
 		}
+
+		// 将读取的数据追加到总数据中
+		totalData = append(totalData, buffer[:bytesRead]...)
+		totalBytesRead += bytesRead
+		// 可以考虑在这里检查 totalData 的长度或其他退出条件
+	}
+	if totalBytesRead == 0 {
 		return
 	}
-	encoded := base64.StdEncoding.EncodeToString(buffer[:bytesRead])
-	w.Write([]byte(encoded))
-	fmt.Printf("Data sent to tunnel client, %d bytes.\n", bytesRead)
+	//encoded := base64.StdEncoding.EncodeToString(buffer[:bytesRead])
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Write(totalData[:totalBytesRead])
+	fmt.Printf("Data sent to tunnel client, %d bytes.\n", totalBytesRead)
 
 }
 
@@ -220,17 +232,17 @@ func handleSend(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// 解码数据
-	decoded, err := base64.StdEncoding.DecodeString(string(data))
-	if err != nil {
-		fmt.Println("Error decoding:", err)
-		return
-	}
-	_, err = connection.conn.Write(decoded)
+	//decoded, err := base64.StdEncoding.DecodeString(string(data))
+	//if err != nil {
+	//	fmt.Println("Error decoding:", err)
+	//	return
+	//}
+	_, err = connection.conn.Write(data)
 	if err != nil {
 		println("Failed to send data to the SOCKS5 connection", http.StatusInternalServerError)
 		return
 	}
 
-	fmt.Println("Data sent to original client", len(decoded), " bytes.")
-	w.WriteHeader(http.StatusOK)
+	fmt.Println("Data sent to original client", len(data), " bytes.")
+	//w.WriteHeader(http.StatusOK)
 }
