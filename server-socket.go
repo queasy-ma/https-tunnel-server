@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"encoding/base64"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"github.com/google/uuid"
 	"io"
@@ -149,6 +150,7 @@ func startHTTPServer() {
 	http.HandleFunc("/recv", handleRecv)
 	http.HandleFunc("/send", handleSend)
 	http.HandleFunc("/info", handleInfo)
+	http.HandleFunc("/close", handleClose)
 	fmt.Println("HTTP server listening on :8089...")
 	if err := http.ListenAndServe(":8089", nil); err != nil {
 		fmt.Println("Failed to start HTTP server:", err)
@@ -170,7 +172,7 @@ func sendSuccessResponse(conn net.Conn, addr net.TCPAddr) error {
 
 func handleRecv(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "GET" {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		http.Error(w, "\nMethod not allowed. from /recv", http.StatusMethodNotAllowed)
 		return
 	}
 
@@ -201,9 +203,14 @@ func handleRecv(w http.ResponseWriter, r *http.Request) {
 			if err == io.EOF {
 				// 客户端已关闭连接
 				println("Client has closed the connection", http.StatusGone)
+				closeByUUID(w, clientID)
+				w.Header().Set("Connectionstatus", "close")
 			} else {
-				// 其他错误
-				println(err.Error(), http.StatusInternalServerError)
+				// 使用类型断言检查错误是否实现了net.Error接口
+				var nErr net.Error
+				if errors.As(err, &nErr) && nErr.Timeout() {
+					// 超时模拟非阻塞读取
+				}
 			}
 			break
 		}
@@ -225,7 +232,7 @@ func handleRecv(w http.ResponseWriter, r *http.Request) {
 
 func handleSend(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "POST" {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		http.Error(w, "\nMethod not allowed. from /send", http.StatusMethodNotAllowed)
 		return
 	}
 
@@ -284,9 +291,35 @@ func handleInfo(w http.ResponseWriter, r *http.Request) {
 	// 拼接所有部分并使用 base64 编码
 	response := strings.Join(parts, "|")
 	encodedResponse := base64.StdEncoding.EncodeToString([]byte(response))
-	println(encodedResponse)
+	//println(encodedResponse)
 	// 设置 HTTP header
 	w.Header().Set("Content-Type", "text/plain")
 	w.WriteHeader(http.StatusOK)
 	w.Write([]byte(encodedResponse))
+}
+
+func closeByUUID(w http.ResponseWriter, clientID string) {
+	// Attempt to find and close the connection
+	storeLock.Lock()
+	if conn, ok := connStore[clientID]; ok {
+		if conn.conn != nil {
+			conn.conn.Close()
+		}
+		delete(connStore, clientID)
+		fmt.Fprintf(w, "\nConnection closed for client_id: %s\n", clientID)
+	} else {
+		fmt.Fprintf(w, "\nNo connection found for client_id: %s\n", clientID)
+	}
+	storeLock.Unlock()
+}
+
+func handleClose(w http.ResponseWriter, r *http.Request) {
+	// Parse query parameters
+	query := r.URL.Query()
+	clientID := query.Get("client_id")
+	if clientID == "" {
+		http.Error(w, "\nMissing client_id", http.StatusBadRequest)
+		return
+	}
+	closeByUUID(w, clientID)
 }
