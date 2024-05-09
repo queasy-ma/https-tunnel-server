@@ -2,19 +2,26 @@ package main
 
 import (
 	"bufio"
+	"encoding/base64"
 	"encoding/binary"
 	"fmt"
+	"github.com/google/uuid"
 	"io"
 	"io/ioutil"
 	"net"
 	"net/http"
 	"os"
+	"strings"
 	"sync"
 	"time"
 )
 
 type Connection struct {
-	conn net.Conn
+	conn      net.Conn
+	target    string
+	port      int
+	isDomain  int
+	isConnect bool
 }
 
 var (
@@ -52,15 +59,12 @@ func startSocks5Server() {
 }
 
 func handleSocks5Connection(conn net.Conn) {
-	//clientID := uuid.New().String()
-	clientID := "8688bb89-5ace-48b1-a158-dfe154429b27"
+	clientID := uuid.New().String()
+	//clientID := "8688bb89-5ace-48b1-a158-dfe154429b27"
 	fmt.Printf("handle connect %v ...\n", conn.RemoteAddr())
 
 	connection := &Connection{conn: conn}
 	println("Get connect id:", clientID)
-	storeLock.Lock()
-	connStore[clientID] = connection
-	storeLock.Unlock()
 
 	reader := bufio.NewReader(conn)
 	buffer := make([]byte, 1024)
@@ -95,6 +99,9 @@ func handleSocks5Connection(conn net.Conn) {
 	case 0x01: // IPv4
 		targetAddr.IP = net.IP(buffer[4:8])
 		targetAddr.Port = int(binary.BigEndian.Uint16(buffer[8:10]))
+		connection.target = targetAddr.IP.String()
+		connection.port = targetAddr.Port
+		connection.isDomain = 0
 	case 0x03: // Domain name
 		domainLength := buffer[4]
 		domainName := string(buffer[5 : 5+domainLength])
@@ -105,10 +112,17 @@ func handleSocks5Connection(conn net.Conn) {
 			return
 		}
 		targetAddr.IP = resolvedIPs[0]
+		connection.target = domainName
+		connection.port = targetAddr.Port
+		connection.isDomain = 1
 	default:
 		fmt.Println("Unsupported address type")
 		return
 	}
+	connection.isConnect = false
+	storeLock.Lock()
+	connStore[clientID] = connection
+	storeLock.Unlock()
 	// 发送成功响应给客户端
 	err = sendSuccessResponse(connection.conn, targetAddr)
 	if err != nil {
@@ -134,6 +148,7 @@ func handleSocks5Connection(conn net.Conn) {
 func startHTTPServer() {
 	http.HandleFunc("/recv", handleRecv)
 	http.HandleFunc("/send", handleSend)
+	http.HandleFunc("/info", handleInfo)
 	fmt.Println("HTTP server listening on :8089...")
 	if err := http.ListenAndServe(":8089", nil); err != nil {
 		fmt.Println("Failed to start HTTP server:", err)
@@ -172,6 +187,9 @@ func handleRecv(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		http.Error(w, "No active connection for this client", http.StatusNotFound)
 		return
+	}
+	if !connection.isConnect {
+		connection.isConnect = true
 	}
 	connection.conn.SetReadDeadline(time.Now().Add(time.Millisecond * 2))
 	buffer := make([]byte, 1024)
@@ -226,6 +244,10 @@ func handleSend(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if !connection.isConnect {
+		connection.isConnect = true
+	}
+
 	data, err := ioutil.ReadAll(r.Body)
 	if err != nil {
 		println("Failed to read data", http.StatusInternalServerError)
@@ -245,4 +267,26 @@ func handleSend(w http.ResponseWriter, r *http.Request) {
 
 	fmt.Println("Data sent to original client", len(data), " bytes.")
 	//w.WriteHeader(http.StatusOK)
+}
+
+func handleInfo(w http.ResponseWriter, r *http.Request) {
+	storeLock.RLock()
+	defer storeLock.RUnlock()
+
+	var parts []string
+	for uuid, conn := range connStore {
+		if !conn.isConnect { // 只选择 isConnect 为 false 的连接
+			part := fmt.Sprintf("%d;%s;%s;%d", conn.isDomain, uuid, conn.target, conn.port)
+			parts = append(parts, part)
+		}
+	}
+
+	// 拼接所有部分并使用 base64 编码
+	response := strings.Join(parts, "|")
+	encodedResponse := base64.StdEncoding.EncodeToString([]byte(response))
+	println(encodedResponse)
+	// 设置 HTTP header
+	w.Header().Set("Content-Type", "text/plain")
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte(encodedResponse))
 }
