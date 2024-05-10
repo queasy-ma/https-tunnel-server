@@ -172,13 +172,13 @@ func sendSuccessResponse(conn net.Conn, addr net.TCPAddr) error {
 
 func handleRecv(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "GET" {
-		http.Error(w, "\nMethod not allowed. from /recv", http.StatusMethodNotAllowed)
+		//http.Error(w, "\nMethod not allowed. from /recv", http.StatusMethodNotAllowed)
 		return
 	}
 
 	clientID := r.URL.Query().Get("client_id")
 	if clientID == "" {
-		http.Error(w, "Client ID is required", http.StatusBadRequest)
+		//http.Error(w, "Client ID is required", http.StatusBadRequest)
 		return
 	}
 
@@ -187,7 +187,8 @@ func handleRecv(w http.ResponseWriter, r *http.Request) {
 	storeLock.RUnlock()
 
 	if !ok {
-		http.Error(w, "No active connection for this client", http.StatusNotFound)
+		println("No active connection for this client")
+		w.Header().Set("Connectionstatus", "close")
 		return
 	}
 	if !connection.isConnect {
