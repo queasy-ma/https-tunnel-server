@@ -204,7 +204,7 @@ func handleRecv(w http.ResponseWriter, r *http.Request) {
 			if err == io.EOF {
 				// 客户端已关闭连接
 				println("Client has closed the connection", http.StatusGone)
-				closeByUUID(w, clientID)
+				closeByUUID(clientID)
 				w.Header().Set("Connectionstatus", "close")
 			} else {
 				// 使用类型断言检查错误是否实现了net.Error接口
@@ -299,7 +299,7 @@ func handleInfo(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte(encodedResponse))
 }
 
-func closeByUUID(w http.ResponseWriter, clientID string) {
+func closeByUUID(clientID string) {
 	// Attempt to find and close the connection
 	storeLock.Lock()
 	if conn, ok := connStore[clientID]; ok {
@@ -307,9 +307,9 @@ func closeByUUID(w http.ResponseWriter, clientID string) {
 			conn.conn.Close()
 		}
 		delete(connStore, clientID)
-		fmt.Fprintf(w, "\nConnection closed for client_id: %s\n", clientID)
+		println("Connection closed and delete for client_id: ", clientID)
 	} else {
-		fmt.Fprintf(w, "\nNo connection found for client_id: %s\n", clientID)
+		println("No connection found for client_id: ", clientID)
 	}
 	storeLock.Unlock()
 }
@@ -322,5 +322,5 @@ func handleClose(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "\nMissing client_id", http.StatusBadRequest)
 		return
 	}
-	closeByUUID(w, clientID)
+	closeByUUID(clientID)
 }
