@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"errors"
+	"flag"
 	"fmt"
 	"github.com/google/uuid"
 	"io"
@@ -18,11 +19,12 @@ import (
 )
 
 type Connection struct {
-	conn      net.Conn
-	target    string
-	port      int
-	isDomain  int
-	isConnect bool
+	conn       net.Conn
+	target     string
+	port       int
+	isDomain   int
+	isConnect  bool
+	createTime time.Time // 添加时间字段
 }
 
 var (
@@ -37,17 +39,52 @@ var (
 )
 
 func main() {
-	go startSocks5Server()
-	startHTTPServer()
+	// 定义命令行参数
+	socks5Port := flag.Int("socks5-port", 1080, "Port to listen on for SOCKS5 server")
+	httpPort := flag.Int("http-port", 8089, "Port to listen on for HTTP server")
+
+	// 定义短参数名
+	sp := flag.Int("sp", 0, "Port to listen on for SOCKS5 server")
+	hp := flag.Int("hp", 0, "Port to listen on for HTTP server")
+
+	flag.Parse() // 解析命令行参数
+
+	// 检查是否使用了短参数名，并根据需要更新端口值
+	if *sp != 0 {
+		*socks5Port = *sp
+	}
+	if *hp != 0 {
+		*httpPort = *hp
+	}
+	go checkAndCloseConnections()
+	go startSocks5Server(*socks5Port)
+	startHTTPServer(*httpPort)
 }
 
-func startSocks5Server() {
-	listener, err := net.Listen("tcp", ":1080")
+func checkAndCloseConnections() {
+	for {
+		time.Sleep(5 * time.Second) // 每5秒执行一次
+
+		storeLock.Lock() // 加写锁
+		for key, conn := range connStore {
+			if time.Since(conn.createTime).Seconds() > 5 && !conn.isConnect { // 检查连接时间是否超过5秒
+				println("[", key, "]", "client no response, close...")
+				conn.conn.Close()      // 关闭连接
+				delete(connStore, key) // 从map中移除
+			}
+		}
+		storeLock.Unlock() // 释放写锁
+	}
+}
+
+func startSocks5Server(port int) {
+	addr := fmt.Sprintf(":%d", port)
+	listener, err := net.Listen("tcp", addr)
 	if err != nil {
 		fmt.Println("Failed to set up listener:", err)
 		os.Exit(1)
 	}
-	fmt.Println("SOCKS5 server listening on :1080...")
+	fmt.Println("SOCKS5 server listening on ", addr)
 
 	for {
 		conn, err := listener.Accept()
@@ -107,12 +144,12 @@ func handleSocks5Connection(conn net.Conn) {
 		domainLength := buffer[4]
 		domainName := string(buffer[5 : 5+domainLength])
 		targetAddr.Port = int(binary.BigEndian.Uint16(buffer[5+domainLength : 5+domainLength+2]))
-		resolvedIPs, err := net.LookupIP(domainName)
-		if err != nil {
-			fmt.Println("Domain name resolution failed:", err)
-			return
-		}
-		targetAddr.IP = resolvedIPs[0]
+		//resolvedIPs, err := net.LookupIP(domainName)
+		//if err != nil {
+		//	fmt.Println("Domain name resolution failed:", err)
+		//	return
+		//}
+		targetAddr.IP = net.ParseIP("127.0.0.1")
 		connection.target = domainName
 		connection.port = targetAddr.Port
 		connection.isDomain = 1
@@ -121,6 +158,7 @@ func handleSocks5Connection(conn net.Conn) {
 		return
 	}
 	connection.isConnect = false
+	connection.createTime = time.Now()
 	storeLock.Lock()
 	connStore[clientID] = connection
 	storeLock.Unlock()
@@ -146,14 +184,15 @@ func handleSocks5Connection(conn net.Conn) {
 
 }
 
-func startHTTPServer() {
+func startHTTPServer(port int) {
 	http.HandleFunc("/recv", handleRecv)
 	http.HandleFunc("/send", handleSend)
 	http.HandleFunc("/info", handleInfo)
 	http.HandleFunc("/close", handleClose)
-	fmt.Println("HTTP server listening on :8089...")
-	if err := http.ListenAndServe(":8089", nil); err != nil {
-		fmt.Println("Failed to start HTTP server:", err)
+	addr := fmt.Sprintf(":%d", port)
+	fmt.Println("HTTPS server listening on ", addr)
+	if err := http.ListenAndServeTLS(addr, "cert.crt", "key.key", nil); err != nil {
+		fmt.Println("Failed to start HTTPS server:", err)
 	}
 }
 
@@ -285,18 +324,18 @@ func handleInfo(w http.ResponseWriter, r *http.Request) {
 	for uuid, conn := range connStore {
 		if !conn.isConnect { // 只选择 isConnect 为 false 的连接
 			part := fmt.Sprintf("%d;%s;%s;%d", conn.isDomain, uuid, conn.target, conn.port)
-			parts = append(parts, part)
+			parts = append(parts, base64.StdEncoding.EncodeToString([]byte(part)))
 		}
 	}
 
 	// 拼接所有部分并使用 base64 编码
 	response := strings.Join(parts, "|")
-	encodedResponse := base64.StdEncoding.EncodeToString([]byte(response))
+	//encodedResponse := base64.StdEncoding.EncodeToString([]byte(response))
 	//println(encodedResponse)
 	// 设置 HTTP header
 	w.Header().Set("Content-Type", "text/plain")
 	w.WriteHeader(http.StatusOK)
-	w.Write([]byte(encodedResponse))
+	w.Write([]byte(response))
 }
 
 func closeByUUID(clientID string) {
