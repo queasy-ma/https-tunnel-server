@@ -32,10 +32,17 @@ var (
 	storeLock = sync.RWMutex{}
 )
 
+type PostListen struct {
+	conn       net.Conn
+	target     string
+	port       int
+	isConnect  bool
+	createTime time.Time // 添加时间字段
+}
+
 var (
-	buffer1  = make([]byte, 1024)
-	dataChan = make(chan []byte)
-	errChan  = make(chan error)
+	listenStore     = make(map[string]*PostListen)
+	listenStoreLock = sync.RWMutex{}
 )
 
 func main() {
@@ -56,9 +63,13 @@ func main() {
 	if *hp != 0 {
 		*httpPort = *hp
 	}
-	go checkAndCloseConnections()
-	go startSocks5Server(*socks5Port)
-	startHTTPServer(*httpPort)
+	//go checkAndCloseConnections()
+	//go startSocks5Server(*socks5Port)
+	//startHTTPServer(*httpPort)
+
+	go checkAndCloseListenConnections()
+	go listenOnPort(9090)
+	startMapHTTPServer(8089)
 }
 
 func checkAndCloseConnections() {
@@ -74,6 +85,55 @@ func checkAndCloseConnections() {
 			}
 		}
 		storeLock.Unlock() // 释放写锁
+	}
+}
+
+func checkAndCloseListenConnections() {
+	for {
+		time.Sleep(5 * time.Second) // 每5秒执行一次
+
+		listenStoreLock.Lock() // 加写锁
+		for key, conn := range listenStore {
+			if time.Since(conn.createTime).Seconds() > 5 && !conn.isConnect { // 检查连接时间是否超过5秒
+				println("[", key, "]", "client no response, close...")
+				//println("[", key, "]", conn.conn.LocalAddr().String(), conn.conn.RemoteAddr().String())
+				conn.conn.Close()        // 关闭连接
+				delete(listenStore, key) // 从map中移除
+			}
+		}
+		listenStoreLock.Unlock() // 释放写锁
+	}
+}
+
+func listenOnPort(port int) {
+	ln, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
+	if err != nil {
+		fmt.Println("Error starting TCP server:", err)
+		return
+	}
+	defer ln.Close()
+	fmt.Printf("Listening on port %d...\n", port)
+
+	for {
+		conn, err := ln.Accept()
+		if err != nil {
+			fmt.Println("Error accepting connection:", err)
+			continue
+		}
+
+		clientID := uuid.New().String() // 生成唯一的客户端ID
+		//clientID := "8688bb89-5ace-48b1-a158-dfe154429b27"
+		listenStoreLock.Lock()
+		listenStore[clientID] = &PostListen{
+			conn:       conn,
+			port:       1081,
+			target:     "127.0.0.1",
+			isConnect:  false,
+			createTime: time.Now(),
+		}
+		listenStoreLock.Unlock()
+
+		fmt.Printf("New connection accepted, client ID: %s\n", clientID)
 	}
 }
 
@@ -196,6 +256,18 @@ func startHTTPServer(port int) {
 	}
 }
 
+func startMapHTTPServer(port int) {
+	http.HandleFunc("/maprecv", handleMapRecv)
+	http.HandleFunc("/mapsend", handleMapSend)
+	http.HandleFunc("/mapinfo", handleMapInfo)
+	http.HandleFunc("/mapclose", handleMapClose)
+	addr := fmt.Sprintf(":%d", port)
+	fmt.Println("HTTPS Map server listening on ", addr)
+	if err := http.ListenAndServeTLS(addr, "cert.crt", "key.key", nil); err != nil {
+		fmt.Println("Failed to start HTTPS server:", err)
+	}
+}
+
 func sendSuccessResponse(conn net.Conn, addr net.TCPAddr) error {
 	var response [10]byte
 	response[0] = 0x05                                            // SOCKS5版本
@@ -233,7 +305,11 @@ func handleRecv(w http.ResponseWriter, r *http.Request) {
 	if !connection.isConnect {
 		connection.isConnect = true
 	}
-	connection.conn.SetReadDeadline(time.Now().Add(time.Millisecond * 2))
+	err := connection.conn.SetReadDeadline(time.Now().Add(time.Millisecond * 2))
+	if err != nil {
+		println("Error SetReadDeadline")
+		return
+	}
 	buffer := make([]byte, 1024)
 	var totalData []byte
 	totalBytesRead := 0
@@ -316,6 +392,109 @@ func handleSend(w http.ResponseWriter, r *http.Request) {
 	//w.WriteHeader(http.StatusOK)
 }
 
+func handleMapRecv(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "GET" {
+		return
+	}
+
+	clientID := r.URL.Query().Get("client_id")
+	if clientID == "" {
+		return
+	}
+
+	listenStoreLock.RLock()
+	connection, ok := listenStore[clientID]
+	listenStoreLock.RUnlock()
+
+	if !ok {
+		fmt.Println("No active connection for this client")
+		w.Header().Set("Connectionstatus", "close")
+		return
+	}
+	if !connection.isConnect {
+		connection.isConnect = true
+	}
+	err := connection.conn.SetReadDeadline(time.Now().Add(time.Millisecond * 2))
+	if err != nil {
+		println("Error SetReadDeadline")
+		return
+	}
+	buffer := make([]byte, 1024)
+	var totalData []byte
+	totalBytesRead := 0
+	for {
+		bytesRead, err := connection.conn.Read(buffer)
+		if err != nil {
+			if err == io.EOF {
+				fmt.Println(clientID, "-Client has closed the connection", http.StatusGone)
+				w.Header().Set("Connectionstatus", "close")
+				closeListenByUUID(clientID)
+			} else {
+				var nErr net.Error
+				if errors.As(err, &nErr) && nErr.Timeout() {
+					// 超时模拟非阻塞读取
+				}
+			}
+			break
+		}
+
+		totalData = append(totalData, buffer[:bytesRead]...)
+		totalBytesRead += bytesRead
+	}
+	if totalBytesRead == 0 {
+		return
+	}
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Write(totalData[:totalBytesRead])
+	fmt.Printf("\n[%s]-Data sent to tunnel client, %d bytes.\n", clientID, totalBytesRead)
+	//for i := 0; i < totalBytesRead; i++ {
+	//	fmt.Printf("%02X ", totalData[i])
+	//}
+}
+
+func handleMapSend(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		http.Error(w, "\nMethod not allowed. from /send", http.StatusMethodNotAllowed)
+		return
+	}
+
+	clientID := r.URL.Query().Get("client_id")
+	if clientID == "" {
+		http.Error(w, "Client ID is required", http.StatusBadRequest)
+		return
+	}
+
+	listenStoreLock.RLock()
+	connection, ok := listenStore[clientID]
+	listenStoreLock.RUnlock()
+
+	if !ok {
+		http.Error(w, "No active connection for this client", http.StatusNotFound)
+		return
+	}
+
+	if !connection.isConnect {
+		connection.isConnect = true
+	}
+
+	data, err := ioutil.ReadAll(r.Body)
+	if err != nil {
+		fmt.Println(clientID, "-Failed to read data", http.StatusInternalServerError)
+		return
+	}
+
+	_, err = connection.conn.Write(data)
+	if err != nil {
+		fmt.Println(clientID, "-Failed to send data to the connection", http.StatusInternalServerError)
+		return
+	}
+
+	fmt.Printf("\n[%s]Data sent to original client %d bytes.\n", clientID, len(data))
+	//for i := 0; i < len(data); i++ {
+	//	fmt.Printf("%02X ", data[i])
+	//}
+}
+
 func handleInfo(w http.ResponseWriter, r *http.Request) {
 	storeLock.RLock()
 	defer storeLock.RUnlock()
@@ -338,6 +517,25 @@ func handleInfo(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte(response))
 }
 
+func handleMapInfo(w http.ResponseWriter, r *http.Request) {
+	storeLock.RLock()
+	defer storeLock.RUnlock()
+
+	var parts []string
+	for uuid, conn := range listenStore {
+		if !conn.isConnect { // 只选择 isConnect 为 false 的连接
+			part := fmt.Sprintf("%s;%s;%d", uuid, conn.target, conn.port)
+			parts = append(parts, base64.StdEncoding.EncodeToString([]byte(part)))
+		}
+	}
+	// 拼接所有部分并使用 base64 编码
+	response := strings.Join(parts, "|")
+	// 设置 HTTP header
+	w.Header().Set("Content-Type", "text/plain")
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte(response))
+}
+
 func closeByUUID(clientID string) {
 	// Attempt to find and close the connection
 	storeLock.Lock()
@@ -353,6 +551,16 @@ func closeByUUID(clientID string) {
 	storeLock.Unlock()
 }
 
+func closeListenByUUID(clientID string) {
+	listenStoreLock.Lock()
+	defer listenStoreLock.Unlock()
+	if connection, ok := listenStore[clientID]; ok {
+		connection.conn.Close()
+		delete(listenStore, clientID)
+		fmt.Printf("Connection with client ID %s closed and removed from store\n", clientID)
+	}
+}
+
 func handleClose(w http.ResponseWriter, r *http.Request) {
 	// Parse query parameters
 	query := r.URL.Query()
@@ -362,4 +570,15 @@ func handleClose(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	closeByUUID(clientID)
+}
+
+func handleMapClose(w http.ResponseWriter, r *http.Request) {
+	// Parse query parameters
+	query := r.URL.Query()
+	clientID := query.Get("client_id")
+	if clientID == "" {
+		http.Error(w, "\nMissing client_id", http.StatusBadRequest)
+		return
+	}
+	closeListenByUUID(clientID)
 }
