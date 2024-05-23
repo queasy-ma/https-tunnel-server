@@ -46,7 +46,7 @@ var (
 )
 
 func main() {
-	// 定义命令行参数
+	//定义命令行参数
 	socks5Port := flag.Int("socks5-port", 1080, "Port to listen on for SOCKS5 server")
 	httpPort := flag.Int("http-port", 8089, "Port to listen on for HTTP server")
 
@@ -54,6 +54,11 @@ func main() {
 	sp := flag.Int("sp", 0, "Port to listen on for SOCKS5 server")
 	hp := flag.Int("hp", 0, "Port to listen on for HTTP server")
 
+	flag.Usage = func() {
+		fmt.Fprintf(os.Stderr, "Usage of %s:\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "  -socks5-port, -sp int\n\tPort to listen on for SOCKS5 server (default 1080)\n")
+		fmt.Fprintf(os.Stderr, "  -http-port, -hp int\n\tPort to listen on for HTTPS server (default 8089)\n")
+	}
 	flag.Parse() // 解析命令行参数
 
 	// 检查是否使用了短参数名，并根据需要更新端口值
@@ -63,13 +68,49 @@ func main() {
 	if *hp != 0 {
 		*httpPort = *hp
 	}
-	//go checkAndCloseConnections()
-	//go startSocks5Server(*socks5Port)
-	//startHTTPServer(*httpPort)
+	go checkAndCloseConnections()
+	go startSocks5Server(*socks5Port)
+	startHTTPServer(*httpPort)
 
-	go checkAndCloseListenConnections()
-	go listenOnPort(9090)
-	startMapHTTPServer(8089)
+	//targetIp := flag.String("target-ip", "127.0.0.1", "port mapping target ip")
+	//targetPort := flag.Int("target-port", 8089, "port mapping target port")
+	//mapPort := flag.Int("map-port", 9090, "port mapping target port")
+	//httpPort := flag.Int("http-port", 8089, "Port to listen on for HTTP server")
+	//
+	//// 定义短参数名
+	//ti := flag.String("ti", "", "port mapping target ip")
+	//tp := flag.Int("tp", 0, "port mapping target port")
+	//mp := flag.Int("mp", 0, "port mapping listen port")
+	//hp := flag.Int("hp", 0, "Port to listen on for HTTP server")
+	//
+	//// 自定义Usage函数
+	//flag.Usage = func() {
+	//	fmt.Fprintf(os.Stderr, "Usage of %s:\n", os.Args[0])
+	//	fmt.Fprintf(os.Stderr, "  -target-ip, -ti string\n\tport mapping target ip (default \"127.0.0.1\")\n")
+	//	fmt.Fprintf(os.Stderr, "  -target-port, -tp int\n\tport mapping target port (default 8089)\n")
+	//	fmt.Fprintf(os.Stderr, "  -map-port, -mp int\n\tport mapping listen port (default 9090)\n")
+	//	fmt.Fprintf(os.Stderr, "  -http-port, -hp int\n\tPort to listen on for HTTPS server (default 8089)\n")
+	//}
+	//
+	//flag.Parse() // 解析命令行参数
+	//
+	//// 检查是否使用了短参数名，并根据需要更新端口值
+	//if *ti != "" {
+	//	*targetIp = *ti
+	//}
+	//if *tp != 0 {
+	//	*targetPort = *tp
+	//}
+	//if *mp != 0 {
+	//	*mapPort = *mp
+	//}
+	//if *hp != 0 {
+	//	*httpPort = *hp
+	//}
+	//
+	//go checkAndCloseListenConnections()
+	//go listenOnPort(*mapPort, *targetIp, *targetPort)
+	//startMapHTTPServer(*httpPort)
 }
 
 func checkAndCloseConnections() {
@@ -79,7 +120,7 @@ func checkAndCloseConnections() {
 		storeLock.Lock() // 加写锁
 		for key, conn := range connStore {
 			if time.Since(conn.createTime).Seconds() > 5 && !conn.isConnect { // 检查连接时间是否超过5秒
-				println("[", key, "]", "client no response, close...")
+				println("\n[", key, "]", "client no response, close...")
 				conn.conn.Close()      // 关闭连接
 				delete(connStore, key) // 从map中移除
 			}
@@ -105,7 +146,7 @@ func checkAndCloseListenConnections() {
 	}
 }
 
-func listenOnPort(port int) {
+func listenOnPort(port int, targetIp string, targrtPort int) {
 	ln, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
 	if err != nil {
 		fmt.Println("Error starting TCP server:", err)
@@ -126,8 +167,8 @@ func listenOnPort(port int) {
 		listenStoreLock.Lock()
 		listenStore[clientID] = &PostListen{
 			conn:       conn,
-			port:       1081,
-			target:     "127.0.0.1",
+			port:       targrtPort,
+			target:     targetIp,
 			isConnect:  false,
 			createTime: time.Now(),
 		}
@@ -228,7 +269,7 @@ func handleSocks5Connection(conn net.Conn) {
 		fmt.Println("Failed to send success response:", err)
 		return
 	}
-	fmt.Printf("Resolved IP: %s, Port: %d\n", targetAddr.IP, targetAddr.Port)
+	//fmt.Printf("Resolved IP: %s, Port: %d\n", targetAddr.IP, targetAddr.Port)
 	//go func() {
 	//	bytesRead, err := connection.conn.Read(buffer1)
 	//	if err != nil {
@@ -298,8 +339,8 @@ func handleRecv(w http.ResponseWriter, r *http.Request) {
 	storeLock.RUnlock()
 
 	if !ok {
-		println("No active connection for this client")
-		w.Header().Set("Connectionstatus", "close")
+		fmt.Printf("\n[%s]-No active connection for this client(GET)", clientID)
+		w.WriteHeader(http.StatusNotFound)
 		return
 	}
 	if !connection.isConnect {
@@ -318,9 +359,10 @@ func handleRecv(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			if err == io.EOF {
 				// 客户端已关闭连接
-				println("Client has closed the connection", http.StatusGone)
+				println("\nClient has closed the connection", http.StatusGone)
 				closeByUUID(clientID)
-				w.Header().Set("Connectionstatus", "close")
+				//w.Header().Set("Connectionstatus", "close")
+				//w.WriteHeader(http.StatusNotFound)
 			} else {
 				// 使用类型断言检查错误是否实现了net.Error接口
 				var nErr net.Error
@@ -342,7 +384,7 @@ func handleRecv(w http.ResponseWriter, r *http.Request) {
 	//encoded := base64.StdEncoding.EncodeToString(buffer[:bytesRead])
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Write(totalData[:totalBytesRead])
-	fmt.Printf("Data sent to tunnel client, %d bytes.\n", totalBytesRead)
+	fmt.Printf("\n[%s]-Data sent to tunnel client, %d bytes.", clientID, totalBytesRead)
 
 }
 
@@ -363,7 +405,8 @@ func handleSend(w http.ResponseWriter, r *http.Request) {
 	storeLock.RUnlock()
 
 	if !ok {
-		http.Error(w, "No active connection for this client", http.StatusNotFound)
+		fmt.Printf("\n[%s]-No active connection for this client(POST)", clientID)
+		w.WriteHeader(http.StatusNotFound)
 		return
 	}
 
@@ -388,7 +431,7 @@ func handleSend(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	fmt.Println("Data sent to original client", len(data), " bytes.")
+	fmt.Printf("\n[%s]Data sent to original client %d bytes.", clientID, len(data))
 	//w.WriteHeader(http.StatusOK)
 }
 
@@ -407,8 +450,8 @@ func handleMapRecv(w http.ResponseWriter, r *http.Request) {
 	listenStoreLock.RUnlock()
 
 	if !ok {
-		fmt.Println("No active connection for this client")
-		w.Header().Set("Connectionstatus", "close")
+		fmt.Printf("\n[%s]-No active connection for this client(GET)", clientID)
+		w.WriteHeader(http.StatusNotFound)
 		return
 	}
 	if !connection.isConnect {
@@ -426,8 +469,7 @@ func handleMapRecv(w http.ResponseWriter, r *http.Request) {
 		bytesRead, err := connection.conn.Read(buffer)
 		if err != nil {
 			if err == io.EOF {
-				fmt.Println(clientID, "-Client has closed the connection", http.StatusGone)
-				w.Header().Set("Connectionstatus", "close")
+				fmt.Println("\n", clientID, "-Client has closed the connection", http.StatusGone)
 				closeListenByUUID(clientID)
 			} else {
 				var nErr net.Error
@@ -446,7 +488,7 @@ func handleMapRecv(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Write(totalData[:totalBytesRead])
-	fmt.Printf("\n[%s]-Data sent to tunnel client, %d bytes.\n", clientID, totalBytesRead)
+	fmt.Printf("\n[%s]-Data sent to tunnel client, %d bytes.", clientID, totalBytesRead)
 	//for i := 0; i < totalBytesRead; i++ {
 	//	fmt.Printf("%02X ", totalData[i])
 	//}
@@ -469,7 +511,8 @@ func handleMapSend(w http.ResponseWriter, r *http.Request) {
 	listenStoreLock.RUnlock()
 
 	if !ok {
-		http.Error(w, "No active connection for this client", http.StatusNotFound)
+		fmt.Printf("\n[%s]-No active connection for this client(POST)", clientID)
+		w.WriteHeader(http.StatusNotFound)
 		return
 	}
 
@@ -489,7 +532,7 @@ func handleMapSend(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	fmt.Printf("\n[%s]Data sent to original client %d bytes.\n", clientID, len(data))
+	fmt.Printf("\n[%s]Data sent to original client %d bytes.", clientID, len(data))
 	//for i := 0; i < len(data); i++ {
 	//	fmt.Printf("%02X ", data[i])
 	//}
